@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
         __m128d x2_v = _mm_mul_pd(x_v, x_v);
         __m128d y2_v = _mm_mul_pd(y_v, y_v);
 
-        while (index[0] < width && index[1] < width) {
+        while (index[0] < width || index[1] < width) {
             y_v = _mm_add_pd(_mm_mul_pd(_mm_mul_pd(two, x_v), y_v), y0_v); // y = 2 * x * y + y0
             x_v = _mm_add_pd(_mm_sub_pd(x2_v, y2_v), x0_v); // x = x * x - y * y + x0
             x2_v = _mm_mul_pd(x_v, x_v);
@@ -106,43 +106,20 @@ int main(int argc, char** argv) {
             repeats[0]++;
             repeats[1]++;
 
-            if (repeats[0] == iters || length_squared_v[0] >= 4) { // index[0] done
+            if (index[0] < width && (repeats[0] == iters || length_squared_v[0] >= 4)) { // index[0] done
                 image[offset + index[0]] = repeats[0];
                 index[0] = cur++;
                 repeats[0] = 0;
                 x0_v[0] = index[0] * col_step + left;
                 x_v[0] = y_v[0] = length_squared_v[0] = x2_v[0] = y2_v[0] = 0;
             }
-            if (repeats[1] == iters || length_squared_v[1] >= 4) { // index[1] done
+            if (index[1] < width && (repeats[1] == iters || length_squared_v[1] >= 4)) { // index[1] done
                 image[offset + index[1]] = repeats[1];
                 index[1] = cur++;
                 repeats[1] = 0;
                 x0_v[1] = index[1] * col_step + left;
                 x_v[1] = y_v[1] = length_squared_v[1] = x2_v[1] = y2_v[1] = 0;
             }
-        }
-        // do the remaining part
-        if (index[0] < width) {
-            while (repeats[0] < iters && length_squared_v[0] < 4) {
-                y_v[0] = 2 * x_v[0] * y_v[0] + y0_v[0];
-                x_v[0] = x2_v[0] - y2_v[0] + x0_v[0];
-                x2_v[0] = x_v[0] * x_v[0];
-                y2_v[0] = y_v[0] * y_v[0];
-                length_squared_v[0] = x2_v[0] + y2_v[0];
-                repeats[0]++;
-            }
-            image[offset + index[0]] = repeats[0];
-        }
-        else if (index[1] < width) {
-            while (repeats[1] < iters && length_squared_v[1] < 4) {
-                y_v[1] = 2 * x_v[1] * y_v[1] + y0_v[1];
-                x_v[1] = x2_v[1] - y2_v[1] + x0_v[1];
-                x2_v[1] = x_v[1] * x_v[1];
-                y2_v[1] = y_v[1] * y_v[1];
-                length_squared_v[1] = x2_v[1] + y2_v[1];
-                repeats[1]++;
-            }
-            image[offset + index[1]] = repeats[1];
         }
     }
 
