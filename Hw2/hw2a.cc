@@ -71,7 +71,7 @@ void *Cal(void* arg) {
         int index[2] = {0, 1}, cur = 2;
         int repeats[2] = {0, 0};
         __m128d y0_v = _mm_set_pd(row_local * row_step + lower, row_local * row_step + lower);
-        double x0[2] = {index[0] * row_step + left, index[1] * col_step + left};
+        double x0[2] = {index[0] * col_step + left, index[1] * col_step + left};
         __m128d x0_v = _mm_load_pd(x0);
         __m128d x_v = _mm_set_pd(0, 0);
         __m128d y_v = _mm_set_pd(0, 0);
