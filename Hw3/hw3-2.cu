@@ -50,11 +50,21 @@ __global__ void phase1(int *d, int round, int v) {
     int j = threadIdx.x + round * B;
 
     if (i < v && j < v) {
-        for (int k = round * B; k < (round + 1) * B; k++) {
-            if (d[i * v + k] + d[k * v + j] < d[i * v + j])
-                d[i * v + j] = d[i * v + k] + d[k * v + j];
+        __shared__ int d_shared[B * B];
+
+        int sharedIndexY = threadIdx.y * B;
+
+        d_shared[sharedIndexY + threadIdx.x] = d[i * v + j];
+        __syncthreads();
+
+        for (int k = 0; k < B; k++) {
+            int newWeight = d_shared[sharedIndexY + k] + d_shared[k * B + threadIdx.x];
+            if (newWeight < d_shared[sharedIndexY + threadIdx.x])
+                d_shared[sharedIndexY + threadIdx.x] = newWeight;
             __syncthreads();
         }
+
+        d[i * v + j] = d_shared[sharedIndexY + threadIdx.x];
     }
 }
 
@@ -73,10 +83,27 @@ __global__ void phase2(int *d, int round, int v) {
         j = pivot_j;
 
     if (i < v && j < v) {
-        for (int k = round * B; k < (round + 1) * B; k++) {
-            if (d[i * v + k] + d[k * v + j] < d[i * v + j])
-                d[i * v + j] = d[i * v + k] + d[k * v + j];
+        __shared__ int pivot_shared[B * B];
+        __shared__ int d_shared[B * B];
+
+        int sharedIndexY = threadIdx.y * B;
+
+        pivot_shared[sharedIndexY + threadIdx.x] = d[pivot_i * v + pivot_j];
+        d_shared[sharedIndexY + threadIdx.x] = d[i * v + j];
+        __syncthreads();
+
+        for (int k = 0; k < B; k++) {
+            int newWeight;
+            if (blockIdx.y == 0)
+                newWeight = pivot_shared[sharedIndexY + k] + d_shared[k * B + threadIdx.x];
+            else
+                newWeight = d_shared[sharedIndexY + k] + pivot_shared[k * B + threadIdx.x];
+
+            if (newWeight < d_shared[sharedIndexY + threadIdx.x])
+                d_shared[sharedIndexY + threadIdx.x] = newWeight;
         }
+
+        d[i * v + j] = d_shared[sharedIndexY + threadIdx.x];
     }
 }
 
@@ -88,10 +115,23 @@ __global__ void phase3(int *d, int round, int v) {
     int j = threadIdx.x + blockIdx.x * B;
 
     if (i < v && j < v) {
-        for (int k = round * B; k < (round + 1) * B; k++) {
-            if (d[i * v + k] + d[k * v + j] < d[i * v + j])
-                d[i * v + j] = d[i * v + k] + d[k * v + j];
+        __shared__ int row_shared[B * B];
+        __shared__ int col_shared[B * B];
+
+        int sharedIndexY = threadIdx.y * B;
+
+        row_shared[sharedIndexY + threadIdx.x] = d[i * v + (threadIdx.x + round * B)];
+        col_shared[sharedIndexY + threadIdx.x] = d[(threadIdx.y + round * B) * v + j];
+        __syncthreads();
+
+        int weight = d[i * v + j];
+        for (int k = 0; k < B; k++) {
+            int newWeight = row_shared[sharedIndexY + k] + col_shared[k * B + threadIdx.x];
+            if (newWeight < weight)
+                weight = newWeight;
         }
+
+        d[i * v + j] = weight;
     }
 }
 
