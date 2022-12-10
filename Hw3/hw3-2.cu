@@ -10,7 +10,6 @@
 cudaDeviceProp prop;
 
 int *Dist;
-// int *Dist_;
 int V, E, V_padding, rounds;
 
 void input(char* infile) {
@@ -20,19 +19,15 @@ void input(char* infile) {
 
     V_padding = (V % B == 0) ? V : (V / B + 1) * B;
     Dist = (int *)malloc(sizeof(int) * V_padding * V_padding);
-    // Dist_ = (int *)malloc(sizeof(int) * V_padding * V_padding);
 
     for (int i = 0; i < V_padding; ++i)
-        for (int j = 0; j < V_padding; ++j) {
+        for (int j = 0; j < V_padding; ++j)
             Dist[i * V_padding + j] = (i == j) ? 0 : INF;
-            // Dist_[i * V_padding + j] = (i == j) ? 0 : INF;
-        }
 
     int pair[3];
     for (int i = 0; i < E; ++i) {
         fread(pair, sizeof(int), 3, file);
         Dist[pair[0] * V_padding + pair[1]] = pair[2];
-        // Dist_[pair[0] * V_padding + pair[1]] = pair[2];
     }
     fclose(file);
     rounds = ceil(V_padding / B);
@@ -49,14 +44,6 @@ void output(char* outFileName) {
 }
 
 int ceil(int a, int b) { return (a + b - 1) / b; }
-
-// void calculate(void) {
-//     for (int k = 0; k < V; k++)
-//         for (int i = 0; i < V; i++)
-//             for (int j = 0; j < V; j++)
-//                 if (Dist_[i * V_padding + k] + Dist_[k * V_padding + j] < Dist_[i * V_padding + j])
-//                     Dist_[i * V_padding + j] = Dist_[i * V_padding + k] + Dist_[k * V_padding + j];
-// }
 
 __global__ void phase1(int *d, int round, int v) {
     int i = threadIdx.y + round * B;
@@ -89,7 +76,6 @@ __global__ void phase2(int *d, int round, int v) {
         for (int k = round * B; k < (round + 1) * B; k++) {
             if (d[i * v + k] + d[k * v + j] < d[i * v + j])
                 d[i * v + j] = d[i * v + k] + d[k * v + j];
-            __syncthreads();
         }
     }
 }
@@ -100,14 +86,11 @@ __global__ void phase3(int *d, int round, int v) {
 
     int i = threadIdx.y + blockIdx.y * B;
     int j = threadIdx.x + blockIdx.x * B;
-    int pivot_i = threadIdx.y + round * B;
-    int pivot_j = threadIdx.x + round * B;
 
     if (i < v && j < v) {
         for (int k = round * B; k < (round + 1) * B; k++) {
             if (d[i * v + k] + d[k * v + j] < d[i * v + j])
                 d[i * v + j] = d[i * v + k] + d[k * v + j];
-            __syncthreads();
         }
     }
 }
