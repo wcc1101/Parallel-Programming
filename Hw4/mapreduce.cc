@@ -6,9 +6,10 @@
 #include <queue>
 #include <list>
 #include <algorithm>
+#include <unistd.h>
 #include <mpi.h>
 #include <pthread.h>
-#include <unistd.h>
+#include <chrono>
 
 #define REQUEST_MAP 0
 #define DISPATCH_MAP 1 
@@ -17,16 +18,16 @@
 #define DISPATCH_REDUCE 4
 #define FINISH_REDUCE 5
 
-// #define (size - 1) 4
+#define JOB_TRACKER 0
+
+typedef std::pair<int, int> taskInfo;
 
 using namespace std;
 
-string job_name, input_filename, locality_config_filename, output_dir;
-int num_reducer, delay, chunk_size;
-int nThreads;
-int num_chunk;
-int num_jobs;
-int size;
+string JOB_NAME, INPUT_FILENAME, LOCALITY_CONFIG_FILENAME, OUTPUT_DIR;
+int NUM_REDUCER, DELAY, CHUNK_SIZE;
+int nNodes, rankId, nThreads;
+int nTasks;
 
 queue<pair<int, int>> tasks;
 queue<pair<int, pair<int, int>>> complete;
@@ -38,19 +39,14 @@ pthread_cond_t cond_complete;
 
 // Modify here to change sorting function
 bool ascending = true;
-static bool comp(pair<string, int> a, pair<string, int> b) {
-    if (ascending == true)
-        return (a.first < b.first);
-    else 
-        return (a.first > b.first);
+// bool ascending = false;
+static bool cmp(pair<string, int> a, pair<string, int> b) {
+    return ascending ? (a.first < b.first) : (a.first > b.first);
 }
 
-struct classcomp {
+struct mapCmp {
     bool operator() (const string& a, const string& b) const {
-        if (ascending == true)
-            return a < b;
-        else 
-            return a > b;
+        return ascending ? (a < b) : (a > b);
     }
 };
 
@@ -67,171 +63,182 @@ int calc_time(struct timespec start_time, struct timespec end_time) {
     return (int)(exe_time+0.5);
 }
 
-void jobTracker(int rank, int size) {
+void JobTracker(void) {
     struct timespec start_time, end_time;
-    list<pair<int, int>> mapTasks;   // job queue
-    int request_node;
-    int job_send[2];    // (chunkID, nodeID)
-    int cnt;
-    int complete_info[3];   // (job, time, pairs)
-    int total_pairs = 0;
-    string line;
-
     clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-    ofstream out(output_dir + job_name + "-log.out");
-    out << time(nullptr) << ",Start_Job," << size << "," << nThreads << "," << job_name << "," << num_reducer << "," << delay << "," << input_filename << "," << chunk_size << "," << locality_config_filename << "," << output_dir << endl;
+    ofstream logFile(OUTPUT_DIR + JOB_NAME + "-log.out");
+    logFile << time(nullptr) << ",Start_Job," << nNodes << "," << nThreads << "," << JOB_NAME << "," << NUM_REDUCER << "," << DELAY << "," << INPUT_FILENAME << "," << CHUNK_SIZE << "," << LOCALITY_CONFIG_FILENAME << "," << OUTPUT_DIR << endl;
 
-    ifstream input_file(locality_config_filename);
-    while (getline(input_file, line)) {
+    list<taskInfo> mapTasks;
+    int request, nChunks = 0, numPairs = 0, task[2], completeInfo[3], taskDone[2] = {-1, -1};
+
+    // Read config
+    ifstream configFile(LOCALITY_CONFIG_FILENAME);
+    string line;
+    while (getline(configFile, line)) {
         size_t pos = line.find(" ");
         int chunkID = stoi(line.substr(0, pos));
-        int nodeID = stoi(line.substr(pos+1)) % (size - 1);
-        mapTasks.push_back(make_pair(chunkID, nodeID));    // Locality information: (chunkID, nodeID)
+        int nodeID = stoi(line.substr(pos + 1)) % (nNodes - 1) + 1;
+        taskInfo tmp = make_pair(chunkID, nodeID);
+        mapTasks.push_back(tmp);
+        nChunks++;
     }
-    input_file.close();
+    configFile.close();
 
-    num_chunk = mapTasks.size();
+    /*****************/
+    /* Map Scheduler */
+    /*****************/
 
+    // Dispatch tasks to mappers
     bool isDispatch;
     while (!mapTasks.empty()) {
         isDispatch = false;
-        MPI_Recv(&request_node, 1, MPI_INT, MPI_ANY_SOURCE, REQUEST_MAP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        for (auto job = mapTasks.begin(); job != mapTasks.end(); job++) {
-            if (job->second == request_node) {
-                job_send[0] = job->first;
-                job_send[1] = job->second;
-                out << time(nullptr) << ",Dispatch_MapTask," << job_send[0] << "," << request_node << endl;
-                MPI_Send(&job_send, 2, MPI_INT, request_node, DISPATCH_MAP, MPI_COMM_WORLD);
-                mapTasks.erase(job);
+        MPI_Recv(&request, 1, MPI_INT, MPI_ANY_SOURCE, REQUEST_MAP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        for (auto mapTask = mapTasks.begin(); mapTask != mapTasks.end(); mapTask++) {
+            if (mapTask->second == request) {
+                task[0] = mapTask->first;
+                task[1] = mapTask->second;
+                logFile << time(nullptr) << ",Dispatch_MapTask," << task[0] << "," << request << endl;
+                MPI_Send(&task, 2, MPI_INT, request, DISPATCH_MAP, MPI_COMM_WORLD);
+                mapTasks.erase(mapTask);
                 isDispatch = true;
                 break;
             }
         }
-        if (isDispatch == false) {
-            job_send[0] = mapTasks.begin()->first;
-            job_send[1] = mapTasks.begin()->second;
-            out << time(nullptr) << ",Dispatch_MapTask," << job_send[0] << "," << request_node << endl;
-            MPI_Send(&job_send, 2, MPI_INT, request_node, DISPATCH_MAP, MPI_COMM_WORLD);
+        if (isDispatch == false) { // not found
+            task[0] = mapTasks.begin()->first;
+            task[1] = mapTasks.begin()->second;
+            logFile << time(nullptr) << ",Dispatch_MapTask," << task[0] << "," << request << endl;
+            MPI_Send(&task, 2, MPI_INT, request, DISPATCH_MAP, MPI_COMM_WORLD);
             mapTasks.erase(mapTasks.begin());
         }
     }
 
-    int jobDone[2] = {-1, -1};
-    for (int i = 0; i < size - 1; i++) {
-        MPI_Recv(&request_node, 1, MPI_INT, MPI_ANY_SOURCE, REQUEST_MAP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        MPI_Send(&jobDone, 2, MPI_INT, request_node, DISPATCH_MAP, MPI_COMM_WORLD);
+    // Tell mappers tasks are all dispatched
+    for (int i = 0; i < nNodes - 1; i++) {
+        MPI_Recv(&request, 1, MPI_INT, MPI_ANY_SOURCE, REQUEST_MAP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Send(&taskDone, 2, MPI_INT, request, DISPATCH_MAP, MPI_COMM_WORLD);
     }
 
-    for (int i = 0; i < num_chunk; i++) {
-        MPI_Recv(&complete_info, 3, MPI_INT, MPI_ANY_SOURCE, FINISH_MAP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        total_pairs += complete_info[2];
-        out << time(nullptr) << ",Complete_MapTask," << complete_info[0] << "," << complete_info[1] << endl;
+    // Receive completeInfo
+    for (int i = 0; i < nChunks; i++) {
+        MPI_Recv(&completeInfo, 3, MPI_INT, MPI_ANY_SOURCE, FINISH_MAP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        numPairs += completeInfo[2];
+        logFile << time(nullptr) << ",Complete_MapTask," << completeInfo[0] << "," << completeInfo[1] << endl;
     }
 
-    out << time(nullptr) << ",Start_Shuffle," << to_string(total_pairs) << endl;
+    /***********/
+    /* Shuffle */
+    /***********/
+
+    logFile << time(nullptr) << ",Start_Shuffle," << to_string(numPairs) << endl;
 
     struct timespec start_shuffle_time, end_shuffle_time;
     clock_gettime(CLOCK_MONOTONIC, &start_shuffle_time);
 
-    ofstream *files = new ofstream[num_reducer];
-    for (int i = 0; i < num_reducer; i++) {
-        files[i] = ofstream(output_dir + job_name + "-intermediate_reducer_" + to_string(i+1) + ".out");
+    // Open intermediate files
+    ofstream *intermediateFiles = new ofstream[NUM_REDUCER];
+    for (int i = 0; i < NUM_REDUCER; i++) {
+        intermediateFiles[i] = ofstream("./intermediate_reducer_" + to_string(i + 1) + ".out");
     }
 
-    vector<pair<string, int>> data;
-    for (int i = 0; i < num_chunk; i++) {
-        data.clear();
-        ifstream input_file(output_dir + job_name + "-intermediate" + to_string(i+1) + ".out");
+    // Read mapping results and write to reducers' interFiles
+    for (int i = 0; i < nChunks; i++) {
+        vector<pair<string, int>> interData;
+        ifstream interFile("./intermediate" + to_string(i + 1) + ".out");
         string line;
-        while (getline(input_file, line)) {
+        while (getline(interFile, line)) {
             size_t pos = line.find(" ");
-            string key = line.substr(0, pos);
-            int value = stoi(line.substr(pos+1));
-            data.push_back(make_pair(key, value));
+            string word = line.substr(0, pos);
+            int count = stoi(line.substr(pos + 1));
+            interData.push_back(make_pair(word, count));
         }
-        // Partition function
-        for (auto it: data) {
-            int idx = (it.first[0] - 'A') % num_reducer;
-            files[idx] << it.first << " " << it.second << endl;
+        for (auto pair: interData) {
+            // Partition function
+            int idx = (int)pair.first[0] % NUM_REDUCER;
+            intermediateFiles[idx] << pair.first << " " << pair.second << endl;
         }
+        interFile.close();
     }
+    for (int i = 0; i < NUM_REDUCER; i++)
+        intermediateFiles[i].close();
 
-    for (int i = 0; i < num_reducer; i++)
-        files[i].close();
-    
     clock_gettime(CLOCK_MONOTONIC, &end_shuffle_time);
-    out << time(nullptr) << ",Finish_Shuffle," << to_string(calc_time(start_shuffle_time, end_shuffle_time)) << endl;
+    logFile << time(nullptr) << ",Finish_Shuffle," << to_string(calc_time(start_shuffle_time, end_shuffle_time)) << endl;
 
-    for (int i = 1; i <= num_reducer; i++) {
-        out << time(nullptr) << ",Dispatch_ReduceTask," << i << "," << request_node << endl;
-        MPI_Recv(&request_node, 1, MPI_INT, MPI_ANY_SOURCE, REQUEST_REDUCE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        MPI_Send(&i, 1, MPI_INT, request_node, DISPATCH_REDUCE, MPI_COMM_WORLD);
+    /********************/
+    /* Reduce Scheduler */
+    /********************/
+
+    // Dispatch tasks to reducers
+    for (int i = 1; i <= NUM_REDUCER; i++) {
+        MPI_Recv(&request, 1, MPI_INT, MPI_ANY_SOURCE, REQUEST_REDUCE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        logFile << time(nullptr) << ",Dispatch_ReduceTask," << task[0] << "," << request << endl;
+        MPI_Send(&i, 1, MPI_INT, request, DISPATCH_REDUCE, MPI_COMM_WORLD);
     }
 
-    for (int i = 0; i < size - 1; i++){
-        MPI_Recv(&request_node, 1, MPI_INT, MPI_ANY_SOURCE, REQUEST_REDUCE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        MPI_Send(&jobDone, 1, MPI_INT, request_node, DISPATCH_REDUCE, MPI_COMM_WORLD);
+    // Tell reducers tasks are all dispatched
+    for (int i = 0; i < nNodes - 1; i++){
+        MPI_Recv(&request, 1, MPI_INT, MPI_ANY_SOURCE, REQUEST_REDUCE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Send(&taskDone, 1, MPI_INT, request, DISPATCH_REDUCE, MPI_COMM_WORLD);
     }
 
-    for (int i = 0; i < num_reducer; i++) {
-        MPI_Recv(&complete_info, 2, MPI_INT, MPI_ANY_SOURCE, FINISH_REDUCE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        out << time(nullptr) << ",Complete_ReduceTask," << complete_info[0] << "," << complete_info[1] << endl;
+    // Receive completeInfo
+    for (int i = 0; i < NUM_REDUCER; i++) {
+        MPI_Recv(&completeInfo, 2, MPI_INT, MPI_ANY_SOURCE, FINISH_REDUCE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        logFile << time(nullptr) << ",Complete_ReduceTask," << completeInfo[0] << "," << completeInfo[1] << endl;
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end_time);
-    out << time(nullptr) << ",Finish_Job," << to_string(calc_time(start_time, end_time)) << endl;
+    logFile << time(nullptr) << ",Finish_Job," << to_string(calc_time(start_time, end_time)) << endl;
+    logFile.close();
 }
 
-void* mapCal(void* arg) {
-    int rank = *(int *)arg;
+void* mapperCal(void* args) {
     struct timespec start_time, end_time, temp;
     double exe_time;
-    bool init_state = true;
+    // bool init_state = true, isEmpty = false;
 
-    while (true) {
+    while (1) {
         pair<int, int> task;
 
+        // Waiting until the other thread done
         pthread_mutex_lock(&mutex);
-        if (tasks.empty()) {
-            if (init_state == false) // done
-                break;
-            else { // waiting
-                pthread_mutex_unlock(&mutex);
-                continue;
-            }
+        while (tasks.empty()) {
+            pthread_cond_wait(&cond, &mutex);
         }
-        init_state = false;
         task = tasks.front();
         tasks.pop();
         pthread_mutex_unlock(&mutex);
 
         clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-        // read from a remote location
-        if (task.second != rank) {
-            sleep(delay);
+        // Reading from a remote location, sleep for DELAY seconds
+        if (task.second != rankId) {
+            sleep(DELAY);
         }
 
         // Input Split function
         map<int, string> records;
-        ifstream input_file(input_filename);
+        ifstream inputFile(INPUT_FILENAME);
         int count = 0;
         string line;
-        while (count != (task.first - 1) * chunk_size && getline(input_file, line)) {
+        // Find the position
+        while (count != (task.first - 1) * CHUNK_SIZE && getline(inputFile, line)) {
             count++;
         }
-        while (count != task.first * chunk_size && getline(input_file, line)) {
+        while (count != task.first * CHUNK_SIZE && getline(inputFile, line)) {
             records[count++] = line;
         }
+        inputFile.close();
 
         // Map function
         map<string, int> map_output;
         size_t pos = 0;
-        string word;
-        for (auto record : records) {
+        for (auto record: records) {
             while ((pos = record.second.find(" ")) != string::npos) {
-                word = record.second.substr(0, pos);
+                string word = record.second.substr(0, pos);
                 if (map_output.count(word) == 0)
                     map_output[word] = 1;
                 else
@@ -246,7 +253,7 @@ void* mapCal(void* arg) {
         }
 
         // Write intermediate result
-        ofstream out(output_dir + job_name + "-intermediate" + to_string(task.first) + ".out");
+        ofstream out("./intermediate" + to_string(task.first) + ".out");
         for (auto it: map_output) {
             out << it.first << " " << it.second << endl;
         }
@@ -254,53 +261,53 @@ void* mapCal(void* arg) {
 
         clock_gettime(CLOCK_MONOTONIC, &end_time);
 
+        // Write into Complete queue
         pthread_mutex_lock(&mutex_complete);
         complete.push(make_pair(task.first, make_pair(calc_time(start_time, end_time), map_output.size())));
-        num_jobs--;
+        nTasks--;
         pthread_mutex_unlock(&mutex_complete);
         pthread_cond_signal(&cond_complete);
     }
 }
 
-void mapper(int rank) {
+void Mapper(void) {
     pthread_t threads[nThreads - 1];
-    pthread_mutex_init(&mutex, NULL);
-    pthread_cond_init(&cond, NULL);
-    pthread_mutex_init(&mutex_complete, NULL);
-    pthread_cond_init(&cond_complete, NULL);
+    pthread_mutex_init(&mutex, nullptr);
+    pthread_cond_init(&cond, nullptr);
+    pthread_mutex_init(&mutex_complete, nullptr);
+    pthread_cond_init(&cond_complete, nullptr);
 
-    int arg[nThreads - 1];
-    for (int i = 0; i < nThreads - 1; i++) {
-        arg[i] = rank;
-        pthread_create(&threads[i], NULL, &mapCal, (void *)&arg[i]);
+    int task[2], completeInfo[3];
+
+    // Create (s-1) threads to do mapping
+    for (int i = 0; i < nThreads-1; i++) {
+        pthread_create(&threads[i], nullptr, &mapperCal, nullptr);
     }
 
-    num_jobs = 0;
-
-    int job[2] = {0};
+    nTasks = 0;
+    // Receive tasks
     while (true) {
         pthread_mutex_lock(&mutex_complete);
-        while (num_jobs == nThreads-1) {
+        while (nTasks == nThreads - 1) {
             pthread_cond_wait(&cond_complete, &mutex_complete);
         }
         pthread_mutex_unlock(&mutex_complete);
-
-        MPI_Send(&rank, 1, MPI_INT, (size - 1), REQUEST_MAP, MPI_COMM_WORLD);
-        MPI_Recv(&job, 2, MPI_INT, (size - 1), DISPATCH_MAP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        if (job[0] == -1) { // End
+        MPI_Send(&rankId, 1, MPI_INT, 0, REQUEST_MAP, MPI_COMM_WORLD);
+        MPI_Recv(&task, 2, MPI_INT, 0, DISPATCH_MAP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (task[0] == -1) { // End
             break;
         }
         pthread_mutex_lock(&mutex_complete);
-        num_jobs++;
-        tasks.push(make_pair(job[0], job[1]));
+        nTasks++;
+        tasks.push(make_pair(task[0], task[1]));
         pthread_mutex_unlock(&mutex_complete);
-        cout << "worker" << rank << " get job" << job[0] << " stored at device" << job[1] << endl;
+        pthread_cond_signal(&cond);
     }
 
-    int complete_info[3];
+    // Send completeInfo
     while (true) {
         pthread_mutex_lock(&mutex_complete);
-        if (complete.empty() && num_jobs == 0) {    // if all jobs are finished and all information is sent
+        if (complete.empty() && nTasks == 0) {    // if all mapTasks are finished and all information is sent
             pthread_mutex_unlock(&mutex_complete);
             break;
         }
@@ -308,10 +315,10 @@ void mapper(int rank) {
             pair<int, pair<int, int>> info = complete.front();
             complete.pop();
             pthread_mutex_unlock(&mutex_complete);
-            complete_info[0] = info.first;
-            complete_info[1] = info.second.first;
-            complete_info[2] = info.second.second;
-            MPI_Send(&complete_info, 3, MPI_INT, (size - 1), FINISH_MAP, MPI_COMM_WORLD);
+            completeInfo[0] = info.first;
+            completeInfo[1] = info.second.first;
+            completeInfo[2] = info.second.second;
+            MPI_Send(&completeInfo, 3, MPI_INT, 0, FINISH_MAP, MPI_COMM_WORLD);
         }
         else {
             pthread_mutex_unlock(&mutex_complete);
@@ -319,102 +326,103 @@ void mapper(int rank) {
     }
 }
 
-void reducer(int rank) {
+void Reducer(void) {
     struct timespec start_time, end_time, temp;
     double exe_time;
-    int job[2] = {0};
-    int complete_info[3];
-    string line;
+    int task[2], completeInfo[3];
     queue<pair<int, int>> reduce_job_time;
+
+    // Receive tasks
     while (true) {
-        MPI_Send(&rank, 1, MPI_INT, (size - 1), REQUEST_REDUCE, MPI_COMM_WORLD);
-        MPI_Recv(&job, 1, MPI_INT, (size - 1), DISPATCH_REDUCE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        if (job[0] == -1) { // termination condition, all tasks are dispatched
+        MPI_Send(&rankId, 1, MPI_INT, JOB_TRACKER, REQUEST_REDUCE, MPI_COMM_WORLD);
+        MPI_Recv(&task, 1, MPI_INT, JOB_TRACKER, DISPATCH_REDUCE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (task[0] == -1) { // End
             break;
         }
-        cout << "worker" << rank << " get reduce job" << job[0] << endl;
         
         clock_gettime(CLOCK_MONOTONIC, &start_time);
 
+        // Read from inter files
         vector<pair<string, int>> data;
-        ifstream input_file(output_dir + job_name + "-intermediate_reducer_" + to_string(job[0]) + ".out");
-
-        while (getline(input_file, line)) {
+        ifstream interFile("./intermediate_reducer_" + to_string(task[0]) + ".out");
+        string line;
+        while (getline(interFile, line)) {
             size_t pos = line.find(" ");
-            string key = line.substr(0, pos);
-            int value = stoi(line.substr(pos+1));
-            data.push_back(make_pair(key, value));
+            string word = line.substr(0, pos);
+            int count = stoi(line.substr(pos+1));
+            data.push_back(make_pair(word, count));
         }
-        input_file.close();
+        interFile.close();
 
         // Sort function
-        sort(data.begin(), data.end(), comp);
+        sort(data.begin(), data.end(), cmp);
 
         // Group function
-        map<string, vector<int>, classcomp>grouped_data;
+        map<string, vector<int>, mapCmp>groupData;
         for (auto it : data) {
-            grouped_data[it.first].push_back(it.second);
+            groupData[it.first].push_back(it.second);
         }
 
         // Reduce function
-        map<string, int>reduce_result;
-        for (auto group : grouped_data) {
+        vector<pair<string, int>>reduce_result;
+        for (auto group : groupData) {
             int sum = 0;
             for (auto it : group.second) {
                 sum += it;
             }
-            reduce_result[group.first] = sum;
+            reduce_result.push_back(make_pair(group.first, sum));
         }
 
         // Output function
-        ofstream output_file(output_dir + job_name + "-" + to_string(job[0]) + ".out");
+        ofstream outputFile(OUTPUT_DIR + JOB_NAME + "-" + to_string(task[0]) + ".out");
         for (auto r : reduce_result)
-            output_file << r.first << " " << r.second << endl;
-        output_file.close();
+            outputFile << r.first << " " << r.second << endl;
+        outputFile.close();
 
         clock_gettime(CLOCK_MONOTONIC, &end_time);
-        reduce_job_time.push(make_pair(job[0], calc_time(start_time, end_time)));
+        reduce_job_time.push(make_pair(task[0], calc_time(start_time, end_time)));
     }
 
+    // Send completeInfo
     while (!reduce_job_time.empty()) {
         pair<int, int> info = reduce_job_time.front();
         reduce_job_time.pop();
-        complete_info[0] = info.first;
-        complete_info[1] = info.second;
-        MPI_Send(&complete_info, 2, MPI_INT, (size - 1), FINISH_REDUCE, MPI_COMM_WORLD);
+        completeInfo[0] = info.first;
+        completeInfo[1] = info.second;
+        MPI_Send(&completeInfo, 2, MPI_INT, JOB_TRACKER, FINISH_REDUCE, MPI_COMM_WORLD);
     }
 }
 
-void taskTracker(int rank) {
-    mapper(rank);
-    reducer(rank);
+void TaskTracker(void) {
+    Mapper();
+    Reducer();
 }
 
 int main(int argc, char **argv) {
-    // Get command arguments
-    job_name = string(argv[1]);
-    num_reducer = stoi(argv[2]);
-    delay = stoi(argv[3]);
-    input_filename = string(argv[4]);
-    chunk_size = stoi(argv[5]);
-    locality_config_filename = string(argv[6]);
-    output_dir = string(argv[7]);
+    JOB_NAME = string(argv[1]);
+    NUM_REDUCER = stoi(argv[2]);
+    DELAY = stoi(argv[3]);
+    INPUT_FILENAME = string(argv[4]);
+    CHUNK_SIZE = stoi(argv[5]);
+    LOCALITY_CONFIG_FILENAME = string(argv[6]);
+    OUTPUT_DIR = string(argv[7]);
 
-    // Initialize MPI
+    // MPI initialize
     MPI_Init(&argc, &argv);
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_size(MPI_COMM_WORLD, &nNodes);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rankId);
 
-    // Get number of threads
+    // thread initialize
     cpu_set_t cpu_set;
     sched_getaffinity(0, sizeof(cpu_set), &cpu_set);
     nThreads = CPU_COUNT(&cpu_set);
 
-    if (rank == (size - 1)) {
-        jobTracker(rank, size);
-    } else {
-        taskTracker(rank);
+    // start MapReduce
+    if (rankId == JOB_TRACKER) {
+        JobTracker();
+    }
+    else {
+        TaskTracker();
     }
 
     MPI_Finalize();
