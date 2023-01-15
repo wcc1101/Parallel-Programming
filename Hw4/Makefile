@@ -2,7 +2,7 @@ CC = mpicc
 CXX = mpicxx
 CXXFLAGS = -O3 -lm -pthread
 CFLAGS = -O3 -lm -phread
-TARGETS = mapreduce hw4
+TARGETS = mapreduce
 
 .PHONY: all
 all: $(TARGETS)
