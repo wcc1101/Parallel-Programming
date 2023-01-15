@@ -19,8 +19,6 @@
 
 #define JOB_TRACKER 0
 
-typedef std::pair<int, int> taskInfo;
-
 using namespace std;
 
 string JOB_NAME, INPUT_FILENAME, LOCALITY_CONFIG_FILENAME, OUTPUT_DIR;
@@ -29,7 +27,7 @@ int nNodes, rankId, nThreads;
 int nTasks;
 
 queue<pair<int, int>> tasks;
-queue<pair<int, pair<int, int>>> complete;
+queue<pair<int, pair<int, int>>> mapComplete;
 
 pthread_mutex_t mutex;
 pthread_cond_t cond;
@@ -58,7 +56,20 @@ int diff(struct timespec start_time, struct timespec end_time) {
         temp.tv_nsec = end_time.tv_nsec - start_time.tv_nsec;
     }
     double exe_time = temp.tv_sec + (double) temp.tv_nsec / 1000000000.0;
-    return (int)(exe_time+0.5);
+    return (int)(exe_time + 0.5);
+}
+
+double totalDiff(struct timespec start_time, struct timespec end_time) {
+    struct timespec temp;
+    if ((end_time.tv_nsec - start_time.tv_nsec) < 0) {
+        temp.tv_sec = end_time.tv_sec-start_time.tv_sec-1;
+        temp.tv_nsec = 1000000000 + end_time.tv_nsec - start_time.tv_nsec;
+    } else {
+        temp.tv_sec = end_time.tv_sec - start_time.tv_sec;
+        temp.tv_nsec = end_time.tv_nsec - start_time.tv_nsec;
+    }
+    double exe_time = temp.tv_sec + (double) temp.tv_nsec / 1000000000.0;
+    return exe_time;
 }
 
 void JobTracker(void) {
@@ -68,7 +79,7 @@ void JobTracker(void) {
     ofstream logFile(OUTPUT_DIR + JOB_NAME + "-log.out");
     logFile << time(nullptr) << ",Start_Job," << nNodes << "," << nThreads << "," << JOB_NAME << "," << NUM_REDUCER << "," << DELAY << "," << INPUT_FILENAME << "," << CHUNK_SIZE << "," << LOCALITY_CONFIG_FILENAME << "," << OUTPUT_DIR << endl;
 
-    list<taskInfo> mapTasks;
+    list<pair<int, int>> mapTasks;
     int request, nChunks = 0, numPairs = 0, task[2], completeInfo[3], taskDone[2] = {-1, -1};
 
     // Read config
@@ -78,7 +89,7 @@ void JobTracker(void) {
         size_t pos = line.find(" ");
         int chunkID = stoi(line.substr(0, pos));
         int nodeID = stoi(line.substr(pos + 1)) % (nNodes - 1) + 1;
-        taskInfo tmp = make_pair(chunkID, nodeID);
+        pair<int, int> tmp = make_pair(chunkID, nodeID);
         mapTasks.push_back(tmp);
         nChunks++;
     }
@@ -180,7 +191,7 @@ void JobTracker(void) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end_time);
-    logFile << time(nullptr) << ",Finish_Job," << to_string(diff(start_time, end_time)) << endl;
+    logFile << time(nullptr) << ",Finish_Job," << to_string(totalDiff(start_time, end_time)) << endl;
     logFile.close();
 }
 
@@ -228,17 +239,11 @@ void* mapperCal(void* args) {
         for (auto record: records) {
             while ((pos = record.second.find(" ")) != string::npos) {
                 string word = record.second.substr(0, pos);
-                if (map_output.count(word) == 0)
-                    map_output[word] = 1;
-                else
-                    map_output[word]++;
+                map_output[word]++;
                 record.second.erase(0, pos + 1);
             }
             // Last one
-            if (map_output.count(record.second) == 0)
-                map_output[record.second] = 1;
-            else
-                map_output[record.second]++;
+            map_output[record.second]++;
         }
 
         // Write intermediate result
@@ -252,7 +257,7 @@ void* mapperCal(void* args) {
 
         // Write into Complete queue
         pthread_mutex_lock(&mutex_complete);
-        complete.push(make_pair(task.first, make_pair(diff(start_time, end_time), map_output.size())));
+        mapComplete.push(make_pair(task.first, make_pair(diff(start_time, end_time), map_output.size())));
         nTasks--;
         pthread_mutex_unlock(&mutex_complete);
         pthread_cond_signal(&cond_complete);
@@ -298,13 +303,13 @@ void Mapper(void) {
     // Send completeInfo
     while (true) {
         pthread_mutex_lock(&mutex_complete);
-        if (complete.empty() && nTasks == 0) {    // if all mapTasks are finished and all information is sent
+        if (mapComplete.empty() && nTasks == 0) {    // if all mapTasks are finished and all information is sent
             pthread_mutex_unlock(&mutex_complete);
             break;
         }
-        else if (!complete.empty()) {   // send information
-            pair<int, pair<int, int>> info = complete.front();
-            complete.pop();
+        else if (!mapComplete.empty()) {   // send information
+            pair<int, pair<int, int>> info = mapComplete.front();
+            mapComplete.pop();
             pthread_mutex_unlock(&mutex_complete);
             completeInfo[0] = info.first;
             completeInfo[1] = info.second.first;
@@ -321,7 +326,7 @@ void Reducer(void) {
     struct timespec start_time, end_time, temp;
     double exe_time;
     int task[2], completeInfo[3];
-    queue<pair<int, int>> reduce_job_time;
+    queue<pair<int, int>> reduceComplete;
 
     // Receive tasks
     while (true) {
@@ -340,7 +345,7 @@ void Reducer(void) {
         while (getline(interFile, line)) {
             size_t pos = line.find(" ");
             string word = line.substr(0, pos);
-            int count = stoi(line.substr(pos+1));
+            int count = stoi(line.substr(pos + 1));
             data.push_back(make_pair(word, count));
         }
         interFile.close();
@@ -374,13 +379,13 @@ void Reducer(void) {
         outputFile.close();
 
         clock_gettime(CLOCK_MONOTONIC, &end_time);
-        reduce_job_time.push(make_pair(task[0], diff(start_time, end_time)));
+        reduceComplete.push(make_pair(task[0], diff(start_time, end_time)));
     }
 
     // Send completeInfo
-    while (!reduce_job_time.empty()) {
-        pair<int, int> info = reduce_job_time.front();
-        reduce_job_time.pop();
+    while (!reduceComplete.empty()) {
+        pair<int, int> info = reduceComplete.front();
+        reduceComplete.pop();
         completeInfo[0] = info.first;
         completeInfo[1] = info.second;
         MPI_Send(&completeInfo, 2, MPI_INT, JOB_TRACKER, FINISH_REDUCE, MPI_COMM_WORLD);
