@@ -9,7 +9,6 @@
 #include <unistd.h>
 #include <mpi.h>
 #include <pthread.h>
-#include <chrono>
 
 #define REQUEST_MAP 0
 #define DISPATCH_MAP 1 
@@ -37,20 +36,19 @@ pthread_cond_t cond;
 pthread_mutex_t mutex_complete;
 pthread_cond_t cond_complete;
 
-// Modify here to change sorting function
-bool ascending = true;
-// bool ascending = false;
 static bool cmp(pair<string, int> a, pair<string, int> b) {
-    return ascending ? (a.first < b.first) : (a.first > b.first);
+    // Modify here to change sorting function
+    return a.first < b.first;
 }
 
 struct mapCmp {
     bool operator() (const string& a, const string& b) const {
-        return ascending ? (a < b) : (a > b);
+        // Modify here to change sorting function
+        return a < b;
     }
 };
 
-int calc_time(struct timespec start_time, struct timespec end_time) {
+int diff(struct timespec start_time, struct timespec end_time) {
     struct timespec temp;
     if ((end_time.tv_nsec - start_time.tv_nsec) < 0) {
         temp.tv_sec = end_time.tv_sec-start_time.tv_sec-1;
@@ -86,10 +84,7 @@ void JobTracker(void) {
     }
     configFile.close();
 
-    /*****************/
     /* Map Scheduler */
-    /*****************/
-
     // Dispatch tasks to mappers
     bool isDispatch;
     while (!mapTasks.empty()) {
@@ -128,10 +123,7 @@ void JobTracker(void) {
         logFile << time(nullptr) << ",Complete_MapTask," << completeInfo[0] << "," << completeInfo[1] << endl;
     }
 
-    /***********/
     /* Shuffle */
-    /***********/
-
     logFile << time(nullptr) << ",Start_Shuffle," << to_string(numPairs) << endl;
 
     struct timespec start_shuffle_time, end_shuffle_time;
@@ -155,7 +147,7 @@ void JobTracker(void) {
             interData.push_back(make_pair(word, count));
         }
         for (auto pair: interData) {
-            // Partition function
+            // Modify here to change partition function
             int idx = (int)pair.first[0] % NUM_REDUCER;
             intermediateFiles[idx] << pair.first << " " << pair.second << endl;
         }
@@ -165,16 +157,13 @@ void JobTracker(void) {
         intermediateFiles[i].close();
 
     clock_gettime(CLOCK_MONOTONIC, &end_shuffle_time);
-    logFile << time(nullptr) << ",Finish_Shuffle," << to_string(calc_time(start_shuffle_time, end_shuffle_time)) << endl;
+    logFile << time(nullptr) << ",Finish_Shuffle," << to_string(diff(start_shuffle_time, end_shuffle_time)) << endl;
 
-    /********************/
     /* Reduce Scheduler */
-    /********************/
-
     // Dispatch tasks to reducers
     for (int i = 1; i <= NUM_REDUCER; i++) {
         MPI_Recv(&request, 1, MPI_INT, MPI_ANY_SOURCE, REQUEST_REDUCE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        logFile << time(nullptr) << ",Dispatch_ReduceTask," << task[0] << "," << request << endl;
+        logFile << time(nullptr) << ",Dispatch_ReduceTask," << i << "," << request << endl;
         MPI_Send(&i, 1, MPI_INT, request, DISPATCH_REDUCE, MPI_COMM_WORLD);
     }
 
@@ -191,7 +180,7 @@ void JobTracker(void) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end_time);
-    logFile << time(nullptr) << ",Finish_Job," << to_string(calc_time(start_time, end_time)) << endl;
+    logFile << time(nullptr) << ",Finish_Job," << to_string(diff(start_time, end_time)) << endl;
     logFile.close();
 }
 
@@ -263,7 +252,7 @@ void* mapperCal(void* args) {
 
         // Write into Complete queue
         pthread_mutex_lock(&mutex_complete);
-        complete.push(make_pair(task.first, make_pair(calc_time(start_time, end_time), map_output.size())));
+        complete.push(make_pair(task.first, make_pair(diff(start_time, end_time), map_output.size())));
         nTasks--;
         pthread_mutex_unlock(&mutex_complete);
         pthread_cond_signal(&cond_complete);
@@ -299,8 +288,10 @@ void Mapper(void) {
         }
         pthread_mutex_lock(&mutex_complete);
         nTasks++;
-        tasks.push(make_pair(task[0], task[1]));
         pthread_mutex_unlock(&mutex_complete);
+        pthread_mutex_lock(&mutex);
+        tasks.push(make_pair(task[0], task[1]));
+        pthread_mutex_unlock(&mutex);
         pthread_cond_signal(&cond);
     }
 
@@ -356,11 +347,14 @@ void Reducer(void) {
 
         // Sort function
         sort(data.begin(), data.end(), cmp);
-
+ 
         // Group function
         map<string, vector<int>, mapCmp>groupData;
         for (auto it : data) {
-            groupData[it.first].push_back(it.second);
+            string key;
+            // Modify here to change group function
+            key = it.first;
+            groupData[key].push_back(it.second);
         }
 
         // Reduce function
@@ -380,7 +374,7 @@ void Reducer(void) {
         outputFile.close();
 
         clock_gettime(CLOCK_MONOTONIC, &end_time);
-        reduce_job_time.push(make_pair(task[0], calc_time(start_time, end_time)));
+        reduce_job_time.push(make_pair(task[0], diff(start_time, end_time)));
     }
 
     // Send completeInfo
